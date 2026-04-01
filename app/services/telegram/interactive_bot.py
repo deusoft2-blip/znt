@@ -40,7 +40,7 @@ class ZabbixInteractiveClient:
     def __init__(self):
         self.session = requests.Session()
         self.base_url = config.get('zabbix', 'url').rstrip('/')
-        self.login = config.get('zabbix', 'login')
+        self.zabbix_login = config.get('zabbix', 'login')
         self.password = config.get('zabbix', 'password')
         self.auth_token: Optional[str] = None
         self.headers = {'Content-Type': 'application/json-rpc'}
@@ -52,7 +52,7 @@ class ZabbixInteractiveClient:
             # 1. Аутентификация через веб-форму для получения cookie
             login_url = f"{self.base_url}/index.php"
             login_data = {
-                "name": self.login,
+                "name": self.zabbix_login,
                 "password": self.password,
                 "enter": "Sign in"
             }
@@ -69,13 +69,13 @@ class ZabbixInteractiveClient:
                 logger.error(f"Ошибка веб-аутентификации: HTTP {response.status_code}")
                 return False
             
-            # 2. Аутентификация через API для получения токена
+            # 2. Аутентификация через API для получения токена (Zabbix 7.x)
             api_url = f"{self.base_url}/api_jsonrpc.php"
             payload = {
                 "jsonrpc": "2.0",
                 "method": "user.login",
                 "params": {
-                    "user": self.login,
+                    "username": self.zabbix_login,  # В Zabbix 7.x используется 'username' вместо 'user'
                     "password": self.password
                 },
                 "id": 1
@@ -88,6 +88,23 @@ class ZabbixInteractiveClient:
                 timeout=self.connect_timeout,
                 verify=False
             )
+            
+            # Если не получилось с username, пробуем старый метод с user (для обратной совместимости)
+            if response.status_code == 200:
+                result = response.json()
+                if 'error' in result and result['error'].get('code') == -32602:
+                    logger.debug("Пробуем альтернативный метод аутентификации...")
+                    payload["params"] = {
+                        "user": self.zabbix_login,
+                        "password": self.password
+                    }
+                    response = self.session.post(
+                        api_url,
+                        json=payload,
+                        headers=self.headers,
+                        timeout=self.connect_timeout,
+                        verify=False
+                    )
             
             if response.status_code != 200:
                 logger.error(f"Ошибка API аутентификации: HTTP {response.status_code}")
@@ -110,7 +127,7 @@ class ZabbixInteractiveClient:
     
     def api_request(self, method: str, params: Dict[str, Any]) -> Optional[Any]:
         """Универсальный метод для API запросов"""
-        if not self.auth_token and not self.login():
+        if not self.auth_token and not self.zabbix_login():
             raise Exception("Не удалось аутентифицироваться в Zabbix API")
             
         try:
@@ -141,7 +158,7 @@ class ZabbixInteractiveClient:
                 if error.get('code') in [-32602, -32603]:  # Ошибки авторизации
                     logger.warning("Сессия устарела, пробуем переаутентифицироваться...")
                     self.auth_token = None
-                    if self.login():
+                    if self.zabbix_login():
                         return self.api_request(method, params)
                 raise Exception(f"API ошибка: {error.get('message')}")
             
@@ -152,11 +169,12 @@ class ZabbixInteractiveClient:
             raise
 
     def get_graph(self, itemid: str, width: int = 900, height: int = 200, period: int = 3600) -> Optional[bytes]:
-        """Получение графика с водяным знаком"""
+        """Получение графика с водяным знаком (совместимо с Zabbix 7.4+)"""
         try:
             chart_name = "Graph"
             range_time = period
             
+            # Формируем URL для получения графика
             graph_url = config.get('zabbix', 'chart_url').format(
                 name=chart_name,
                 itemid=itemid,
@@ -164,9 +182,16 @@ class ZabbixInteractiveClient:
                 range_time=range_time
             )
             
+            logger.debug(f"Запрос графика: {graph_url}")
             response = self.session.get(graph_url, verify=False, timeout=self.connect_timeout)
             
-            if response.status_code == 200 and response.content:
+            # Проверка успешного получения графика
+            if response.status_code == 200 and len(response.content) > 0:
+                # Проверяем, что это действительно изображение (PNG/JPG)
+                if not response.content.startswith(b'\x89PNG') and not response.content.startswith(b'\xff\xd8\xff'):
+                    logger.warning(f"Получены некорректные данные графика (не изображение)")
+                    return None
+                    
                 img = Image.open(io.BytesIO(response.content))
                 
                 # Добавляем водяной знак если включено
@@ -182,8 +207,8 @@ class ZabbixInteractiveClient:
                 img_byte_arr = io.BytesIO()
                 img.save(img_byte_arr, format='PNG')
                 return img_byte_arr.getvalue()
-                
-            logger.error(f"Ошибка получения графика: HTTP {response.status_code}")
+            
+            logger.error(f"Ошибка получения графика: HTTP {response.status_code}, размер: {len(response.content)}")
             return None
             
         except Exception as e:
@@ -191,16 +216,26 @@ class ZabbixInteractiveClient:
             return None
 
     def find_host_by_ip(self, ip_address: str) -> Optional[Dict[str, Any]]:
-        """Поиск хоста по IP адресу"""
+        """Поиск хоста по IP адресу (совместимо с Zabbix 7.x)"""
         try:
+            # В Zabbix 7.x нужно использовать selectInterfaces и фильтровать вручную
             hosts = self.api_request('host.get', {
                 'output': ['hostid', 'name'],
-                'selectInterfaces': ['ip'],
-                'filter': {'interface_ip': ip_address}
+                'selectInterfaces': ['ip', 'type'],
+                'filter': {'status': 0}  # Только включенные хосты
             })
             
-            if hosts:
-                return hosts[0]
+            if not hosts:
+                return None
+            
+            # Фильтруем хосты по IP адресу интерфейса
+            for host in hosts:
+                interfaces = host.get('interfaces', [])
+                for interface in interfaces:
+                    if interface.get('ip') == ip_address:
+                        # Возвращаем хост без интерфейсов (очищаем данные)
+                        return {'hostid': host['hostid'], 'name': host['name']}
+            
             return None
         except Exception as e:
             logger.error(f"Ошибка поиска хоста: {str(e)}")

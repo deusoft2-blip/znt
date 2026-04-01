@@ -52,6 +52,13 @@ class ZabbixReq:
                     cookies=cookie,
                     verify=False,
                     timeout=connect_timeout)
+                
+                # Проверка успешного получения графика (для Zabbix 7.4+)
+                if response.status_code == 200 and len(response.content) > 0:
+                    return response.content
+                else:
+                    self.logger.warning(f"График не получен: HTTP {response.status_code}, размер: {len(response.content)}")
+                    return False
             except Exception as err:
                 self.logger.error("{}/{}: Ошибка подключения к Zabbix ({}): {}".format(
                     attempts, connect_max_attempts, self.url, err))
